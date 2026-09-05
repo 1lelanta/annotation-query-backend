@@ -893,7 +893,6 @@ def cell_component(
                 }
             )
 
-        go_ids = []
         protein_node_map = {}
 
         for node in nodes:
@@ -905,57 +904,67 @@ def cell_component(
                         protein_node_map[id] = {}
                     protein_node_map[id]["data"] = {**single_node, "location": ""}
 
-        go_subcomponents = {
-            "type": "go",
-            "id": "",
-            "properties": {"subontology": "cellular_component"},
-        }
-
-        go_parent = {"type": "go", "id": "", "properties": {}}
-
-        for location in locations:
-            go_id = location.lower()
-            go_id = go_id.replace(":", "_")
-            go_ids.append(go_id)
-
-        query = db_instance.list_query_generator_source_target(
-            go_subcomponents, go_parent, go_ids, "subclass_of"
+        protein_ids = [protein_id for protein_id in proteins if protein_id]
+        location_ids = [location.strip().upper() for location in locations if location.strip()]
+        escaped_protein_ids = ", ".join(
+            f"'{protein_id.replace(chr(39), chr(39) * 2)}'" for protein_id in protein_ids
+        )
+        escaped_location_ids = ", ".join(
+            f"'{location_id.replace(chr(39), chr(39) * 2)}'" for location_id in location_ids
         )
 
-        result = db_instance.run_query(query)
-        parsed_result_go = db_instance.parse_list_query(result)
-
-        go_ids = []
-
-        for key in parsed_result_go.keys():
-            go_ids.append(key)
-            go_ids.extend(parsed_result_go[key]["node_ids"])
-
-        source = {"type": "go", "id": "", "properties": {}}
-
-        target = {"type": "protein", "id": "", "properties": {}}
-
-        query = db_instance.list_query_generator_both(
-            source, target, go_ids, proteins, "go_gene_product"
-        )
+        query = f"""
+        MATCH (protein:protein)-[relationship:located_in]->
+              (component:cellular_component)
+        WHERE protein.id IN [{escaped_protein_ids}]
+          AND component.id IN [{escaped_location_ids}]
+        RETURN protein, relationship, component
+        """
 
         result = db_instance.run_query(query)
-        parsed_result = db_instance.parse_list_query(result)
+        component_nodes = {}
+        component_edges = []
 
-        for key in parsed_result.keys():
-            normalized_id = []
-            location = parsed_result[key]["node_ids"]
-            for i, _ in enumerate(location):
-                for parent_id in parsed_result_go.keys():
-                    if (
-                        location[i] == parent_id
-                        or location[i] in parsed_result_go[parent_id]["node_ids"]
-                    ):
-                        normalized_id.append(parent_id.replace("_", ":").upper())
-            protein_node_map[key]["data"]["location"] = ",".join(normalized_id)
+        for record in result:
+            protein = record["protein"]
+            relationship = record["relationship"]
+            component = record["component"]
+            protein_id = protein["id"]
+            component_id = component["id"]
+            protein_graph_id = f"protein {protein_id}"
+            component_graph_id = f"cellular_component {component_id}"
+
+            if protein_id in protein_node_map:
+                current_location = protein_node_map[protein_id]["data"].get("location", "")
+                locations_for_protein = [value for value in current_location.split(",") if value]
+                if component_id not in locations_for_protein:
+                    locations_for_protein.append(component_id)
+                protein_node_map[protein_id]["data"]["location"] = ",".join(
+                    locations_for_protein
+                )
+
+            component_nodes[component_graph_id] = {
+                "data": {
+                    "id": component_graph_id,
+                    "type": "cellular_component",
+                    **dict(component),
+                }
+            }
+            edge_data = {
+                "id": generate(),
+                "source": protein_graph_id,
+                "target": component_graph_id,
+                "label": relationship.type,
+                "edge_id": f"protein_{relationship.type}_cellular_component",
+            }
+            for key, value in relationship.items():
+                edge_data["source_data" if key == "source" else key] = value
+            component_edges.append({"data": edge_data})
 
         for values in protein_node_map.values():
             response["nodes"].append(values)
+        response["nodes"].extend(component_nodes.values())
+        response["edges"].extend(component_edges)
 
         logger.info(
             json.dumps(
