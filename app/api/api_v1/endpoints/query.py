@@ -61,6 +61,66 @@ def _get_graph_for_annotation(existing_doc, redis_client):
  
     return {"nodes": [], "edges": []}
 
+
+def _add_cellular_components(graph, locations, db_instance):
+    """Add cellular component nodes and protein-to-component edges."""
+    protein_ids = {
+        node["data"]["id"].split(" ", 1)[1]
+        for node in graph.get("nodes", [])
+        if node.get("data", {}).get("type") == "protein"
+        and " " in node.get("data", {}).get("id", "")
+    }
+    location_ids = {location.strip().upper() for location in locations if location.strip()}
+    if not protein_ids:
+        return graph
+
+    escaped_protein_ids = ", ".join(
+        f"'{protein_id.replace(chr(39), chr(39) * 2)}'" for protein_id in protein_ids
+    )
+    location_filter = ""
+    if location_ids:
+        escaped_location_ids = ", ".join(
+            f"'{location_id.replace(chr(39), chr(39) * 2)}'" for location_id in location_ids
+        )
+        location_filter = f"AND component.id IN [{escaped_location_ids}]"
+    query = f"""
+    MATCH (protein:protein)-[relationship:located_in]->
+          (component:cellular_component)
+        WHERE protein.id IN [{escaped_protein_ids}]
+            {location_filter}
+    RETURN protein, relationship, component
+    """
+
+    component_nodes = {}
+    component_edges = []
+    for record in db_instance.run_query(query):
+        protein = record["protein"]
+        relationship = record["relationship"]
+        component = record["component"]
+        protein_graph_id = f"protein {protein['id']}"
+        component_graph_id = f"cellular_component {component['id']}"
+        component_nodes[component_graph_id] = {
+            "data": {
+                "id": component_graph_id,
+                "type": "cellular_component",
+                **dict(component),
+            }
+        }
+        edge_data = {
+            "id": generate(),
+            "source": protein_graph_id,
+            "target": component_graph_id,
+            "label": relationship.type,
+            "edge_id": f"protein_{relationship.type}_cellular_component",
+        }
+        for key, value in relationship.items():
+            edge_data["source_data" if key == "source" else key] = value
+        component_edges.append({"data": edge_data})
+
+    graph["nodes"].extend(component_nodes.values())
+    graph["edges"].extend(component_edges)
+    return graph
+
 def _create_annotation_from_existing(existing_doc, current_user_id, data_source, species, requests, fingerprint, redis_client):
     """
     Creates a new annotation for the current user reusing the existing doc's
@@ -536,6 +596,7 @@ def get_annotation_by_id(
     source: Optional[str] = FQuery(None),
     auth_header: Optional[str] = Depends(oauth2_scheme),
     redis_client=Depends(get_redis_client),
+    db_instance=Depends(get_db_instance),
 ):
     current_user_id = None
 
@@ -634,6 +695,7 @@ def get_annotation_by_id(
             pass
     file_path = cursor.path_url
     species = cursor.species
+    db_instance = get_db_instance(species or "human")
     source = cursor.data_source
     if not isinstance(source, list):
         source = [source] if source else ['all']
@@ -683,6 +745,7 @@ def get_annotation_by_id(
             cache_data = json.loads(cache)
             graph = cache_data.get("graph")
             if graph:
+                graph = _add_cellular_components(graph, [], db_instance)
                 response_data["nodes"] = graph.get("nodes")
                 response_data["edges"] = graph.get("edges")
             return response_data
@@ -692,6 +755,7 @@ def get_annotation_by_id(
             if file_path and os.path.exists(file_path):
                 with open(file_path, "r") as f:
                     graph = json.load(f)
+                graph = _add_cellular_components(graph, [], db_instance)
                 response_data["nodes"] = graph.get("nodes")
                 response_data["edges"] = graph.get("edges")
             else:
@@ -720,6 +784,7 @@ def get_annotation_by_id(
                 response_data['status'] = TaskStatus.COMPLETE.value
                 with open(resolved_path, 'r') as f:
                     graph = json.load(f)
+                graph = _add_cellular_components(graph, [], db_instance)
                 response_data['nodes'] = graph.get('nodes')
                 response_data['edges'] = graph.get('edges')
         return response_data
