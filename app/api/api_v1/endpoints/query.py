@@ -37,6 +37,7 @@ from app.events.redis_event import RedisStopEvent
 from app.core.config import settings
 import jwt
 import re
+from copy import deepcopy
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -727,12 +728,127 @@ def get_annotation_by_id(
     return response_data
 
 
+def _repair_mork_sexpr(line: str) -> str:
+    """
+    Repair truncated string literals in MORK S-expression output.
+    MORK without interning limits symbols to 63 bytes. String literals longer than
+    63 bytes get truncated before the closing quotation mark, producing malformed
+    MeTTa syntax like `(node description (...) "A long text...))` without the closing `"`.
+    This function detects unclosed string literals and inserts the closing quote before
+    the outer closing parentheses.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return line
+
+    in_quote = False
+    open_parens_outside_quotes = 0
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and in_quote and i + 1 < len(line):
+            i += 2
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                open_parens_outside_quotes += 1
+            elif ch == ")":
+                open_parens_outside_quotes = max(0, open_parens_outside_quotes - 1)
+        i += 1
+
+    if in_quote:
+        idx = len(line)
+        parens_found = 0
+        while idx > 0 and parens_found < open_parens_outside_quotes:
+            idx -= 1
+            if line[idx] == ")":
+                parens_found += 1
+            elif line[idx] not in (" ", "\t", "\r", "\n"):
+                idx += 1
+                break
+        return line[:idx] + '"' + line[idx:]
+    return line
+
+
+def _repair_mork_output(raw: str) -> str:
+    return "\n".join(_repair_mork_sexpr(line) for line in raw.splitlines())
+
+
+def _clean_mork_val(v):
+    if isinstance(v, list):
+        if len(v) == 1:
+            v = v[0]
+        else:
+            v = " ".join(str(x) for x in v)
+    if isinstance(v, str):
+        v = v.strip()
+        if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+            v = v[1:-1]
+    return v
+
+
+def _run_mork_single_pattern(db_instance, pattern_str: str, template_str: str):
+    """
+    Executes a single MORK pattern query safely, repairing any truncated
+    string literals produced by MORK's 63-byte symbol buffer limit.
+    """
+    if hasattr(db_instance, "_run_single_pattern"):
+        import hashlib
+        import uuid
+        from app.services.mork_cli_generator import _get_session
+
+        dataset_id = hashlib.md5(str(db_instance.dataset_path.resolve()).encode()).hexdigest()[:8]
+        target_space = f"mork_{dataset_id}"
+        act_file = db_instance.dataset_path / db_instance.act_filename
+        shm_act = Path("/dev/shm") / f"{target_space}.act"
+
+        if not shm_act.exists() or (act_file.stat().st_mtime > shm_act.stat().st_mtime):
+            try:
+                temp_shm = Path("/dev/shm") / f"{shm_act.name}.tmp.{uuid.uuid4().hex}"
+                os.symlink(act_file.resolve(), temp_shm)
+                os.replace(temp_shm, shm_act)
+            except Exception as e:
+                if not shm_act.exists():
+                    logger.warning(f"SHM Symlink update failed: {e}")
+
+        metta_query = f"(exec 0 (I (ACT {target_space} {pattern_str})) (, {template_str}))"
+        query_file = Path("/dev/shm") / f"query_{uuid.uuid4().hex}.metta"
+        try:
+            fd = os.open(query_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(metta_query)
+            session = _get_session(str(db_instance.dataset_path))
+            result = session.exec_query(str(query_file))
+            raw = result.stdout
+            actual = raw.split("result:", 1)[1].strip() if "result:" in raw else raw.strip()
+            if not actual:
+                return []
+            repaired = _repair_mork_output(actual)
+            try:
+                return db_instance.metta.parse_all(repaired)
+            except Exception as e:
+                logger.warning(f"Failed to parse MORK output: {e}\nRaw: {actual}")
+                return []
+        except Exception as e:
+            logger.error(f"MORK query error: {e}")
+            return []
+        finally:
+            if query_file.exists():
+                try:
+                    query_file.unlink()
+                except Exception:
+                    pass
+    return []
+
+
 @router.get("/localized-graph")
 def cell_component(
     id: str = FQuery(..., description="The annotation ID"),
     locations: str = FQuery(..., description="Comma-separated GO term IDs"),
     current_user_id: str = Depends(get_current_user),
-    db_instance=Depends(get_db_instance),
+    schema_manager: SchemaManager = Depends(get_schema_manager),
 ):
 
     # get annotation id and get go term id
@@ -904,36 +1020,124 @@ def cell_component(
                         protein_node_map[protein_raw_id] = {}
                     protein_node_map[protein_raw_id]["data"] = {**single_node, "location": ""}
 
-        # --- New Neo4j schema: direct protein -[:located_in]-> cellular_component match ---
+        annotation = AnnotationStorageService.get_by_id(annotation_id)
+        species = (getattr(annotation, "species", None) or "human") if annotation else "human"
+        db_instance = get_db_instance(species)
+
+        # --- Fetch direct protein -> cellular_component matches per backend ---
         protein_ids = [protein_id for protein_id in proteins if protein_id]
         location_ids = [location.strip().upper() for location in locations if location.strip()]
 
-        escaped_protein_ids = ", ".join(
-            f"'{protein_id.replace(chr(39), chr(39) * 2)}'" for protein_id in protein_ids
-        )
-        escaped_location_ids = ", ".join(
-            f"'{location_id.replace(chr(39), chr(39) * 2)}'" for location_id in location_ids
-        )
+        if settings.DATABASE_TYPE.get("type") in ["mork", "mork_cli"]:
+            mork_schema = deepcopy(schema_manager.full_schema_representation)
+            species_schema = mork_schema.setdefault(species, {"nodes": {}, "edges": {}})
+            species_schema["nodes"].setdefault(
+                "cellular_component",
+                {"properties": {key: {} for key in (
+                    "id", "term_name", "description", "source", "source_url"
+                )}},
+            )
+            species_schema["edges"].setdefault(
+                "located_in",
+                {"properties": {key: {} for key in (
+                    "evidence", "db_reference", "taxon_id", "qualifier", "source", "source_url"
+                )}},
+            )
 
-        query = f"""
+            mork_atoms = []
+            # 1. Fetch cellular_component node properties once per unique location_id
+            for location_id in location_ids:
+                target = f"cellular_component {location_id}"
+                for property_name in species_schema["nodes"]["cellular_component"]["properties"]:
+                    mork_atoms.extend(
+                        _run_mork_single_pattern(
+                            db_instance,
+                            f"({property_name} ({target}) $v)",
+                            f"(tmp (node {property_name} ({target}) $v))",
+                        )
+                    )
+
+            # 2. Fetch located_in edge properties for each (protein, location) pair
+            for protein_id in protein_ids:
+                for location_id in location_ids:
+                    source = f"protein {protein_id}"
+                    target = f"cellular_component {location_id}"
+                    for property_name in species_schema["edges"]["located_in"]["properties"]:
+                        mork_atoms.extend(
+                            _run_mork_single_pattern(
+                                db_instance,
+                                f"({property_name} (located_in ({source}) ({target})) $v)",
+                                f"(tmp (edge {property_name} (located_in ({source}) ({target})) $v))",
+                            )
+                        )
+
+            serialized = db_instance.parse_and_serialize_properties(
+                [mork_atoms], {"properties": True}, "graph"
+            )
+            serialized_nodes = {}
+            for node in serialized.get("nodes", []):
+                node_data = {
+                    key: _clean_mork_val(value)
+                    for key, value in node["data"].items()
+                }
+                raw_id = str(node_data.get("id", "")).removeprefix("cellular_component").strip()
+                serialized_nodes[raw_id] = node_data
+                serialized_nodes[f"cellular_component {raw_id}"] = node_data
+
+            component_records = []
+            for edge in serialized.get("edges", []):
+                edge_data = edge["data"]
+                if edge_data.get("label") != "located_in":
+                    continue
+                source_id = edge_data["source"]
+                target_id = edge_data["target"]
+                raw_target_id = str(target_id).removeprefix("cellular_component").strip()
+                target_node = (
+                    serialized_nodes.get(target_id)
+                    or serialized_nodes.get(raw_target_id)
+                    or {}
+                )
+                if target_node:
+                    component_records.append(
+                        (
+                            {"id": source_id.split(" ", 1)[1]},
+                            {
+                                key: value
+                                for key, value in edge_data.items()
+                                if key not in {"id", "source", "target", "label", "edge_id"}
+                            },
+                            target_node,
+                        )
+                    )
+        else:
+            escaped_protein_ids = ", ".join(
+                f"'{protein_id.replace(chr(39), chr(39) * 2)}'" for protein_id in protein_ids
+            )
+            escaped_location_ids = ", ".join(
+                f"'{location_id.replace(chr(39), chr(39) * 2)}'" for location_id in location_ids
+            )
+
+            query = f"""
 MATCH (protein:protein)-[relationship:located_in]->
       (component:cellular_component)
 WHERE protein.id IN [{escaped_protein_ids}]
   AND component.id IN [{escaped_location_ids}]
 RETURN protein, relationship, component
 """
-
-        result = db_instance.run_query(query)
+            result = db_instance.run_query(query)
+            component_records = [
+                (record["protein"], record["relationship"], record["component"])
+                for record in result
+            ]
 
         component_nodes = {}
         component_edges = []
 
-        for record in result:
-            protein = record["protein"]
-            relationship = record["relationship"]
-            component = record["component"]
+        for protein, relationship, component in component_records:
             protein_id = protein["id"]
-            component_id = component["id"]
+            component_id = str(component.get("id", "")).removeprefix("cellular_component").strip()
+            if not component_id:
+                continue
             protein_graph_id = f"protein {protein_id}"
             component_graph_id = f"cellular_component {component_id}"
 
@@ -957,14 +1161,19 @@ RETURN protein, relationship, component
                 }
             }
 
+            relationship_type = relationship.type if hasattr(relationship, "type") else "located_in"
             edge_data = {
                 "id": generate(),
                 "source": protein_graph_id,
                 "target": component_graph_id,
-                "label": relationship.type,
-                "edge_id": f"protein_{relationship.type}_cellular_component",
+                "label": relationship_type,
+                "edge_id": f"protein_{relationship_type}_cellular_component",
             }
+        
+            structural_keys = {"id", "target", "label", "edge_id"}
             for key, value in relationship.items():
+                if key in structural_keys:
+                    continue
                 edge_data["source_data" if key == "source" else key] = value
             component_edges.append({"data": edge_data})
 
