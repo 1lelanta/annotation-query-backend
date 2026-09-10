@@ -1109,6 +1109,91 @@ def cell_component(
                             target_node,
                         )
                     )
+
+        elif settings.DATABASE_TYPE.get("type") == "metta":
+
+            CELLULAR_COMPONENT_PROPERTIES = ("term_name", "description", "source", "source_url")
+            LOCATED_IN_EDGE_PROPERTIES = ("evidence", "db_reference", "taxon_id", "qualifier", "source", "source_url")
+
+            def _run_metta_pattern(match_clause, return_clause):
+                query_code = f"!(match &space (, {match_clause}) (, {return_clause}))"
+                try:
+                    result = db_instance.run_query(query_code)
+                except Exception as e:
+                    logger.warning(f"MeTTa query error: {e}\nQuery: {query_code}")
+                    return []
+                if not result:
+                    return []
+                return result[0] if isinstance(result[0], list) else result
+
+            metta_atoms = []
+
+            for location_id in location_ids:
+                target = f"cellular_component {location_id}"
+                match_terms = []
+                return_terms = []
+                for prop in CELLULAR_COMPONENT_PROPERTIES:
+                    var = f"${db_instance.generate_id()}"
+                    match_terms.append(f"({prop} ({target}) {var})")
+                    return_terms.append(f"(node {prop} ({target}) {var})")
+                metta_atoms.extend(_run_metta_pattern(" ".join(match_terms), " ".join(return_terms)))
+
+            for protein_id in protein_ids:
+                for location_id in location_ids:
+                    source = f"protein {protein_id}"
+                    target = f"cellular_component {location_id}"
+                    match_terms = []
+                    return_terms = []
+                    for prop in LOCATED_IN_EDGE_PROPERTIES:
+                        var = f"${db_instance.generate_id()}"
+                        match_terms.append(f"({prop} (located_in ({source}) ({target})) {var})")
+                        return_terms.append(f"(edge {prop} (located_in ({source}) ({target})) {var})")
+                    metta_atoms.extend(_run_metta_pattern(" ".join(match_terms), " ".join(return_terms)))
+
+            serialized = db_instance.parse_and_serialize_properties(
+                [metta_atoms], {"properties": True}, "graph"
+            )
+            # This backend's underlying loader silently drops quoted,
+            # multi-word string facts, so cellular_localization_sample.metta
+            # was generated with underscores in place of spaces for any
+            # text property (term_name, description, source) to survive
+            # loading. Convert back to spaces here so the API response
+            # matches Neo4j/Mork's human-readable format exactly.
+            _SPACE_RESTORE_KEYS = ("term_name", "description", "source")
+            serialized_nodes = {
+                node["data"]["id"]: {
+                    key: (
+                        value.replace("_", " ")
+                        if key in _SPACE_RESTORE_KEYS and isinstance(value, str)
+                        else value
+                    )
+                    for key, value in node["data"].items()
+                }
+                for node in serialized.get("nodes", [])
+            }
+
+            component_records = []
+            for edge in serialized.get("edges", []):
+                edge_data = edge["data"]
+                if edge_data.get("label") != "located_in":
+                    continue
+                source_id = edge_data["source"]
+                target_id = edge_data["target"]
+                target_node = serialized_nodes.get(target_id)
+                if not target_node:
+                    continue
+                component_records.append(
+                    (
+                        {"id": source_id.split(" ", 1)[1]},
+                        {
+                            key: value
+                            for key, value in edge_data.items()
+                            if key not in {"id", "source", "target", "label", "edge_id"}
+                        },
+                        target_node,
+                    )
+                )
+
         else:
             escaped_protein_ids = ", ".join(
                 f"'{protein_id.replace(chr(39), chr(39) * 2)}'" for protein_id in protein_ids
@@ -1169,7 +1254,7 @@ RETURN protein, relationship, component
                 "label": relationship_type,
                 "edge_id": f"protein_{relationship_type}_cellular_component",
             }
-        
+
             structural_keys = {"id", "target", "label", "edge_id"}
             for key, value in relationship.items():
                 if key in structural_keys:
