@@ -37,6 +37,7 @@ from app.events.redis_event import RedisStopEvent
 from app.core.config import settings
 import jwt
 import re
+from copy import deepcopy
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -726,13 +727,12 @@ def get_annotation_by_id(
 
     return response_data
 
-
 @router.get("/localized-graph")
 def cell_component(
     id: str = FQuery(..., description="The annotation ID"),
     locations: str = FQuery(..., description="Comma-separated GO term IDs"),
     current_user_id: str = Depends(get_current_user),
-    db_instance=Depends(get_db_instance),
+    schema_manager: SchemaManager = Depends(get_schema_manager),
 ):
 
     # get annotation id and get go term id
@@ -893,69 +893,55 @@ def cell_component(
                 }
             )
 
-        go_ids = []
         protein_node_map = {}
 
         for node in nodes:
             if node["data"]["type"] == "protein":
                 for single_node in node["data"]["nodes"]:
-                    id = single_node["id"].split(" ")[1]
-                    proteins.append(id)
-                    if id not in protein_node_map:
-                        protein_node_map[id] = {}
-                    protein_node_map[id]["data"] = {**single_node, "location": ""}
+                    protein_raw_id = single_node["id"].split(" ")[1]
+                    proteins.append(protein_raw_id)
+                    if protein_raw_id not in protein_node_map:
+                        protein_node_map[protein_raw_id] = {}
+                    protein_node_map[protein_raw_id]["data"] = {**single_node, "location": ""}
 
-        go_subcomponents = {
-            "type": "go",
-            "id": "",
-            "properties": {"subontology": "cellular_component"},
-        }
+        annotation = AnnotationStorageService.get_by_id(annotation_id)
+        species = (getattr(annotation, "species", None) or "human") if annotation else "human"
+        db_instance = get_db_instance(species)
 
-        go_parent = {"type": "go", "id": "", "properties": {}}
-
+        # The frontend sends GO IDs colon-separated (GO:0005634) but they are
+        # stored underscore-separated (GO_0005634). Query with the stored
+        # form; the colon form is restored before returning.
+        protein_ids = [protein_id for protein_id in proteins if protein_id]
+        location_ids = []
         for location in locations:
-            go_id = location.lower()
-            go_id = go_id.replace(":", "_")
-            go_ids.append(go_id)
+            location = location.strip().upper()
+            if not location:
+                continue
+            location_ids.append(location.replace(":", "_"))
 
-        query = db_instance.list_query_generator_source_target(
-            go_subcomponents, go_parent, go_ids, "subclass_of"
-        )
+        def _to_colon_form(component_id):
+            """GO_0005634 -> GO:0005634, for the frontend's location field."""
+            component_id = str(component_id)
+            return component_id.replace("_", ":", 1) if component_id.startswith("GO_") else component_id
 
-        result = db_instance.run_query(query)
-        parsed_result_go = db_instance.parse_list_query(result)
+        located_pairs = db_instance.find_localized_proteins(protein_ids, location_ids, species=species)
 
-        go_ids = []
-
-        for key in parsed_result_go.keys():
-            go_ids.append(key)
-            go_ids.extend(parsed_result_go[key]["node_ids"])
-
-        source = {"type": "go", "id": "", "properties": {}}
-
-        target = {"type": "protein", "id": "", "properties": {}}
-
-        query = db_instance.list_query_generator_both(
-            source, target, go_ids, proteins, "go_gene_product"
-        )
-
-        result = db_instance.run_query(query)
-        parsed_result = db_instance.parse_list_query(result)
-
-        for key in parsed_result.keys():
-            normalized_id = []
-            location = parsed_result[key]["node_ids"]
-            for i, _ in enumerate(location):
-                for parent_id in parsed_result_go.keys():
-                    if (
-                        location[i] == parent_id
-                        or location[i] in parsed_result_go[parent_id]["node_ids"]
-                    ):
-                        normalized_id.append(parent_id.replace("_", ":").upper())
-            protein_node_map[key]["data"]["location"] = ",".join(normalized_id)
+        # Only protein nodes are returned. The frontend reads each protein's
+        # "location" field (comma-separated GO IDs, colon form) to drive the
+        # cell visualizer, and does not expect cellular_component nodes/edges.
+        for protein_id, component_id in located_pairs:
+            if protein_id not in protein_node_map:
+                continue
+            colon_id = _to_colon_form(component_id)
+            current_location = protein_node_map[protein_id]["data"].get("location", "")
+            locations_for_protein = [v for v in current_location.split(",") if v]
+            if colon_id not in locations_for_protein:
+                locations_for_protein.append(colon_id)
+            protein_node_map[protein_id]["data"]["location"] = ",".join(locations_for_protein)
 
         for values in protein_node_map.values():
             response["nodes"].append(values)
+        
 
         logger.info(
             json.dumps(
