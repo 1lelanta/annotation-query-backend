@@ -7,6 +7,7 @@ import os
 from collections import Counter
 import re
 from pathlib import Path
+from functools import lru_cache
 import yaml
 from app.lib.db_resilience import ResilientDriver, RetryPolicy, QueryType, QueryTimeoutConfig
 from app.lib.result_formatter import Result_Formatter
@@ -61,12 +62,17 @@ _PATH_EVIDENCE_FIELDS = {
 _PATH_OPERATORS = {">": ">", ">=": ">=", "<": "<", "<=": "<=", "==": "=", "!=": "<>"}
 
 
+@lru_cache(maxsize=1)
 def _path_schema_whitelist() -> tuple[set[str], set[str]]:
     root = Path(__file__).resolve().parents[2] / "config"
     node_types: set[str] = set()
     edge_types: set[str] = set()
     for schema_path in root.glob("**/*.yaml"):
-        document = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+        try:
+            document = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, OSError):
+            logger.warning("Skipping unreadable path schema file: %s", schema_path)
+            continue
         if not isinstance(document, dict):
             continue
         for section_name, target in (("nodes", node_types), ("relationships", edge_types), ("edges", edge_types)):
@@ -82,9 +88,6 @@ def _path_schema_whitelist() -> tuple[set[str], set[str]]:
                         if isinstance(label, str):
                             target.add(label)
     return node_types, edge_types
-
-
-_PATH_NODE_TYPES, _PATH_EDGE_TYPES = _path_schema_whitelist()
 
 
 class CypherQueryGenerator(QueryGeneratorInterface):
@@ -181,9 +184,10 @@ class CypherQueryGenerator(QueryGeneratorInterface):
 
     @classmethod
     def _path_endpoint_clauses(cls, endpoints: list[dict], prefix: str, params: dict) -> list[str]:
+        path_node_types, _ = _path_schema_whitelist()
         by_type: dict[str, list[str]] = {}
         for endpoint in endpoints:
-            node_type = cls._path_type(endpoint["type"], _PATH_NODE_TYPES, "node type")
+            node_type = cls._path_type(endpoint["type"], path_node_types, "node type")
             by_type.setdefault(node_type, []).append(endpoint["id"])
         clauses = []
         for index, (node_type, ids) in enumerate(sorted(by_type.items())):
@@ -195,11 +199,12 @@ class CypherQueryGenerator(QueryGeneratorInterface):
     @classmethod
     def _path_id_clauses(cls, endpoints: list[dict], resolved_ids: set[str], variable: str,
                          prefix: str, params: dict) -> list[str]:
+        path_node_types, _ = _path_schema_whitelist()
         by_type: dict[str, list[str]] = {}
         for endpoint in endpoints:
             if endpoint["id"] not in resolved_ids:
                 continue
-            node_type = cls._path_type(endpoint["type"], _PATH_NODE_TYPES, "node type")
+            node_type = cls._path_type(endpoint["type"], path_node_types, "node type")
             by_type.setdefault(node_type, []).append(endpoint["id"])
         clauses = []
         for index, (node_type, ids) in enumerate(sorted(by_type.items())):
@@ -210,6 +215,8 @@ class CypherQueryGenerator(QueryGeneratorInterface):
 
     @classmethod
     def _path_filter_where(cls, request: dict, params: dict) -> list[str]:
+        _, path_edge_types = _path_schema_whitelist()
+        path_node_types, _ = _path_schema_whitelist()
         where = [
             "all(n IN nodes(p) WHERE single(m IN nodes(p) WHERE m = n))",
         ]
@@ -218,7 +225,7 @@ class CypherQueryGenerator(QueryGeneratorInterface):
             values = edge_types[kind]
             if not values:
                 continue
-            values = [cls._path_type(value, _PATH_EDGE_TYPES, "edge type") for value in values]
+            values = [cls._path_type(value, path_edge_types, "edge type") for value in values]
             name = f"edge_{kind}_types"
             params[name] = values
             predicate = f"type(r) IN ${name}"
@@ -233,7 +240,7 @@ class CypherQueryGenerator(QueryGeneratorInterface):
             values = intermediate[kind]
             if not values:
                 continue
-            values = [cls._path_type(value, _PATH_NODE_TYPES, "node type") for value in values]
+            values = [cls._path_type(value, path_node_types, "node type") for value in values]
             name = f"intermediate_{kind}_types"
             params[name] = values
             predicate = f"any(label IN labels(n) WHERE label IN ${name})"
@@ -344,12 +351,18 @@ class CypherQueryGenerator(QueryGeneratorInterface):
             f"({' OR '.join(target_clauses)})",
         ]
         where.extend(self._path_filter_where(request, params))
-        params["candidate_cap"] = candidate_cap
+        params["candidate_cap"] = candidate_cap + 1
         path_query = f"""
 MATCH p=(s)-[*1..{max_hops}]-(t)
 WHERE {' AND '.join(where)}
 WITH p, [n IN nodes(p) | n.id] AS path_ids
-ORDER BY path_ids
+WITH p, path_ids,
+     [r IN relationships(p) WHERE r.score IS NOT NULL] AS scored_rels
+WITH p, path_ids,
+     CASE WHEN size(scored_rels) = 0 THEN 0.0
+          ELSE reduce(total = 0.0, r IN scored_rels | total + r.score) / size(scored_rels)
+     END AS path_score
+ORDER BY length(p) ASC, path_score DESC, path_ids ASC
 LIMIT $candidate_cap
 WITH p, nodes(p) AS path_nodes, relationships(p) AS path_rels
 RETURN
@@ -374,10 +387,13 @@ RETURN
             query_type=QueryType.PATHS,
             params=params,
         )
+        records = list(records)
         return {
-            "candidates": [self._serialize_path_record(record) for record in records],
+            "candidates": [
+                self._serialize_path_record(record) for record in records[:candidate_cap]
+            ],
             "unresolved_ids": unresolved_ids,
-            "truncated": len(records) >= candidate_cap,
+            "truncated": len(records) > candidate_cap,
         }
 
     LOCALIZATION_PREDICATES = ("located_in", "part_of")

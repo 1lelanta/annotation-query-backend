@@ -5,6 +5,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.api_v1.endpoints import paths as paths_endpoint
+from app.lib.db_resilience import QueryTimeoutError, QueryType
 from app.services.path_search import normalize_request, process_candidates
 from tests.fixtures.path_graph import CANDIDATES, THREE_PATH_CANDIDATES
 
@@ -29,6 +30,11 @@ class FakeBackend:
             "unresolved_ids": list(self.unresolved_ids),
             "truncated": False,
         }
+
+
+class TimeoutBackend:
+    def find_paths(self, request):
+        raise QueryTimeoutError(QueryType.PATHS, 10.0)
 
 
 def request(**changes):
@@ -149,6 +155,12 @@ def test_endpoint_no_path_returns_reason():
     response = call_endpoint(FakeBackend())
     assert response["paths"] == []
     assert response["reason"] == "no path within 3 hops"
+
+
+def test_endpoint_path_timeout_is_504():
+    with pytest.raises(HTTPException) as raised:
+        call_endpoint(TimeoutBackend())
+    assert raised.value.status_code == 504
 
 
 @pytest.mark.parametrize(

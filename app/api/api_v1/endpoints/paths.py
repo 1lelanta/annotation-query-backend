@@ -4,6 +4,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
 from app.api.deps import get_current_user, get_db_instance, get_schema_manager
+from app.lib.db_resilience import QueryTimeoutError
 from app.services.path_search import PathRequestError, normalize_request, process_candidates
 
 
@@ -36,6 +37,8 @@ def find_paths(
         raise HTTPException(status_code=500, detail="The configured backend does not support paths")
     try:
         result = db_instance.find_paths(normalized)
+    except QueryTimeoutError as error:
+        raise HTTPException(status_code=504, detail="Path search timed out") from error
     except PathRequestError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     response = process_candidates(result, normalized)

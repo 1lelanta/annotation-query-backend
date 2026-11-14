@@ -314,7 +314,7 @@ class ResilientDriver:
         try:
             results = []
             with self.session() as session:
-                result = session.run(query_code, **(params or {}))
+                result = session.run(query_code, parameters=params)
                 for record in result:
                     if stop_event is not None and stop_event.is_set():
                         raise TaskCancelledException()
@@ -406,7 +406,7 @@ class ResilientDriver:
                     # No timeout: use lazy loading
                     results = []
                     with self.session() as session:
-                        result = session.run(query_code, **(params or {}))
+                        result = session.run(query_code, parameters=params)
                         for record in result:
                             if stop_event is not None and stop_event.is_set():
                                 raise TaskCancelledException()

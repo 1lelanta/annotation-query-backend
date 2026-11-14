@@ -27,6 +27,8 @@ import pytest
 from app.lib.validator import LogicValidationError
 from app.services.cypher_generator import CypherQueryGenerator
 from app.lib.db_resilience import QueryType
+from app.lib.db_resilience import QueryTimeoutConfig, QueryTimeoutError, ResilientDriver, RetryPolicy
+from app.services import cypher_generator as cypher_module
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -196,7 +198,7 @@ def test_find_paths_inlines_bounded_hops_and_uses_path_query_type(monkeypatch):
     path_query, kwargs = calls[1]
     assert "[*1..4]" in path_query
     assert kwargs["query_type"] == QueryType.PATHS
-    assert kwargs["params"]["candidate_cap"] == 100
+    assert kwargs["params"]["candidate_cap"] == 101
 
 
 @pytest.mark.parametrize("max_hops", [0, 5])
@@ -239,6 +241,93 @@ def test_find_paths_pushes_all_filters_and_returns_degree(monkeypatch):
     assert "COUNT { (n)--() }" in query
     assert "degree:" in query
     assert kwargs["params"]["hub_max_degree"] == 12
+
+
+def test_find_paths_orders_before_limit_by_shared_ranking(monkeypatch):
+    generator, calls = path_generator(monkeypatch)
+    generator.find_paths(paths_request())
+    query = calls[1][0]
+    assert "[r IN relationships(p) WHERE r.score IS NOT NULL]" in query
+    assert "reduce(total = 0.0, r IN scored_rels | total + r.score)" in query
+    assert "ORDER BY length(p) ASC, path_score DESC, path_ids ASC" in query
+    assert query.index("ORDER BY") < query.index("LIMIT $candidate_cap")
+
+
+@pytest.mark.parametrize(
+    ("row_count", "expected_candidates", "expected_truncated"),
+    [(6, 5, True), (5, 5, False), (3, 3, False)],
+)
+def test_find_paths_fetches_extra_row_and_truncates(
+    monkeypatch, row_count, expected_candidates, expected_truncated
+):
+    generator = CypherQueryGenerator.__new__(CypherQueryGenerator)
+    calls = []
+
+    def run_query(query, **kwargs):
+        calls.append((query, kwargs))
+        if "endpoint_ids_" in query:
+            return [{"id": "ENSG00000136244"}, {"id": "P12345"}]
+        return [{"nodes": [], "edges": []} for _ in range(row_count)]
+
+    monkeypatch.setattr(generator, "run_query", run_query)
+    k = 1
+    result = generator.find_paths(paths_request(k=k))
+    cap = min(max(k * 5, k + 1), 1000)
+    assert len(result["candidates"]) == expected_candidates
+    assert result["truncated"] is expected_truncated
+    assert calls[1][1]["params"]["candidate_cap"] == cap + 1
+
+
+def test_path_schema_whitelist_is_lazy_and_skips_bad_files(monkeypatch):
+    class BadFile:
+        def read_text(self, **kwargs):
+            raise OSError("unreadable")
+
+    class GoodFile:
+        def read_text(self, **kwargs):
+            return "nodes:\n  safe_node: {}\nrelationships:\n  safe_edge: {}\n"
+
+    monkeypatch.setattr(cypher_module.Path, "glob", lambda self, pattern: [BadFile(), GoodFile()])
+    cypher_module._path_schema_whitelist.cache_clear()
+    try:
+        assert cypher_module._path_schema_whitelist() == ({"safe_node"}, {"safe_edge"})
+        assert cypher_module._path_schema_whitelist.cache_info().currsize == 1
+    finally:
+        cypher_module._path_schema_whitelist.cache_clear()
+
+
+def test_resilient_driver_passes_parameters_keyword(monkeypatch):
+    driver = ResilientDriver.__new__(ResilientDriver)
+    driver._timeout_config = QueryTimeoutConfig(timeouts={QueryType.DEFAULT: None})
+    driver._policy = RetryPolicy(max_attempts=1)
+    captured = {}
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return []
+
+    monkeypatch.setattr(driver, "session", lambda: Session())
+    assert driver.run_with_retry("RETURN 1", params={"id": "safe"}) == []
+    assert captured == {"args": ("RETURN 1",), "kwargs": {"parameters": {"id": "safe"}}}
+
+
+def test_paths_timeout_is_not_a_no_path_result(monkeypatch):
+    generator = CypherQueryGenerator.__new__(CypherQueryGenerator)
+
+    def timeout(*args, **kwargs):
+        raise QueryTimeoutError(QueryType.PATHS, 10.0)
+
+    monkeypatch.setattr(generator, "run_query", timeout)
+    with pytest.raises(QueryTimeoutError):
+        generator.find_paths(paths_request())
 
 
 @pytest.mark.parametrize("hostile", ['"', "`", "(", ")", ";", "{", "}", "'", "\\"])
