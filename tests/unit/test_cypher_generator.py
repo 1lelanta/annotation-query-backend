@@ -26,6 +26,7 @@ import pytest
 
 from app.lib.validator import LogicValidationError
 from app.services.cypher_generator import CypherQueryGenerator
+from app.lib.db_resilience import QueryType
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -155,6 +156,120 @@ def call_counts(result_query, arms, labels):
 def anchor_path(result_query, arms, labels):
     """Return the expected (result, total-count, count-by-label) queries of the anchor path."""
     return (result_query,) + call_counts(result_query, arms, labels)
+
+
+def paths_request(**overrides):
+    request = {
+        "sources": [{"type": "gene", "id": "ENSG00000136244"}],
+        "targets": [{"type": "protein", "id": "P12345"}],
+        "species": "human",
+        "max_hops": 3,
+        "k": 20,
+        "edge_types": {"allow": ["interacts_with"], "exclude": []},
+        "intermediate_node_types": {"allow": ["protein"], "exclude": []},
+        "evidence_filters": [{"field": "score", "operator": ">=", "value": 700}],
+        "hub_avoidance": {
+            "enabled": True,
+            "max_degree": 100,
+            "exclude_ids": ["hub-id"],
+        },
+    }
+    request.update(overrides)
+    return request
+
+
+def path_generator(monkeypatch, records=None):
+    generator = CypherQueryGenerator.__new__(CypherQueryGenerator)
+    calls = []
+
+    def run_query(query, **kwargs):
+        calls.append((query, kwargs))
+        return records if records is not None else [{"id": "ENSG00000136244"}, {"id": "P12345"}]
+
+    monkeypatch.setattr(generator, "run_query", run_query)
+    return generator, calls
+
+
+def test_find_paths_inlines_bounded_hops_and_uses_path_query_type(monkeypatch):
+    generator, calls = path_generator(monkeypatch)
+    generator.find_paths(paths_request(max_hops=4))
+    path_query, kwargs = calls[1]
+    assert "[*1..4]" in path_query
+    assert kwargs["query_type"] == QueryType.PATHS
+    assert kwargs["params"]["candidate_cap"] == 100
+
+
+@pytest.mark.parametrize("max_hops", [0, 5])
+def test_find_paths_rejects_out_of_range_hops(monkeypatch, max_hops):
+    generator, calls = path_generator(monkeypatch)
+    with pytest.raises(ValueError):
+        generator.find_paths(paths_request(max_hops=max_hops))
+    assert calls == []
+
+
+def test_find_paths_rejects_unknown_inlined_types_and_evidence_fields(monkeypatch):
+    generator, calls = path_generator(monkeypatch)
+    with pytest.raises(ValueError):
+        generator.find_paths(paths_request(edge_types={"allow": ["not_a_real_type"], "exclude": []}))
+    with pytest.raises(ValueError):
+        generator.find_paths(paths_request(
+            evidence_filters=[{"field": "not_numeric", "operator": ">=", "value": 1}]
+        ))
+    assert calls == []
+
+
+def test_find_paths_pushes_all_filters_and_returns_degree(monkeypatch):
+    generator, calls = path_generator(monkeypatch)
+    generator.find_paths(paths_request(
+        edge_types={"allow": ["interacts_with"], "exclude": ["part_of"]},
+        intermediate_node_types={"allow": ["protein"], "exclude": ["gene"]},
+        evidence_filters=[
+            {"field": "score", "operator": ">=", "value": 700},
+            {"field": "p_value", "operator": "<", "value": 0.05},
+        ],
+        hub_avoidance={"enabled": True, "max_degree": 12, "exclude_ids": ["hub-id"]},
+    ))
+    query, kwargs = calls[1]
+    assert "type(r) IN $edge_allow_types" in query
+    assert "none(r IN relationships(p) WHERE type(r) IN $edge_exclude_types)" in query
+    assert "label IN $intermediate_allow_types" in query
+    assert "none(n IN nodes(p)[1..-1]" in query
+    assert "r.`score` >= $evidence_0" in query
+    assert "r.`p_value` < $evidence_1" in query
+    assert "COUNT { (n)--() }" in query
+    assert "degree:" in query
+    assert kwargs["params"]["hub_max_degree"] == 12
+
+
+@pytest.mark.parametrize("hostile", ['"', "`", "(", ")", ";", "{", "}", "'", "\\"])
+def test_find_paths_keeps_hostile_ids_in_parameters(monkeypatch, hostile):
+    def run_with_source(source_id):
+        generator = CypherQueryGenerator.__new__(CypherQueryGenerator)
+        calls = []
+
+        def run_query(query, **kwargs):
+            calls.append((query, kwargs))
+            parameters = kwargs["params"]
+            endpoint_ids = [
+                value
+                for key, values in parameters.items()
+                if key.startswith("endpoint_ids_")
+                for value in values
+            ]
+            if endpoint_ids:
+                return [{"id": value} for value in endpoint_ids]
+            return []
+
+        monkeypatch.setattr(generator, "run_query", run_query)
+        generator.find_paths(paths_request(
+            sources=[{"type": "gene", "id": source_id}],
+        ))
+        return calls
+
+    safe_calls = run_with_source("GENE1")
+    hostile_calls = run_with_source(hostile)
+    assert [query for query, _ in safe_calls] == [query for query, _ in hostile_calls]
+    assert hostile in hostile_calls[0][1]["params"]["endpoint_ids_0"]
 
 
 GENE_PATHWAY_COUNTS = (
