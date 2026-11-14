@@ -198,7 +198,7 @@ def _candidate_score(path: dict) -> float:
 
 def _matches(path: dict, request: dict) -> bool:
     nodes, edges = path.get("nodes", []), path.get("edges", [])
-    if not nodes or len(edges) != len(nodes) - 1 or len(edges) > request["max_hops"]:
+    if not nodes or not edges or len(edges) != len(nodes) - 1 or len(edges) > request["max_hops"]:
         return False
     ids = [node.get("id") for node in nodes]
     if len(ids) != len(set(ids)):
