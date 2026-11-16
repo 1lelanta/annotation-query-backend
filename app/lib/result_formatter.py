@@ -259,23 +259,7 @@ class Result_Formatter:
         
         if _NATIVE_AVAILABLE:
             try:
-                formatted = _graph_native.format_neo4j_count(results, graph_components)
-                node_order = [node["type"] for node in graph_components.get("nodes", [])]
-                edge_order = [
-                    predicate["type"].replace(" ", "_").lower()
-                    for predicate in graph_components.get("predicates", [])
-                ]
-                node_positions = {label: index for index, label in enumerate(node_order)}
-                edge_positions = {label: index for index, label in enumerate(edge_order)}
-                formatted["node_count_by_label"] = sorted(
-                    formatted["node_count_by_label"],
-                    key=lambda item: node_positions.get(item["label"], len(node_positions)),
-                )
-                formatted["edge_count_by_label"] = sorted(
-                    formatted["edge_count_by_label"],
-                    key=lambda item: edge_positions.get(item["label"], len(edge_positions)),
-                )
-                return formatted
+                return _graph_native.format_neo4j_count(results, graph_components)
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception(

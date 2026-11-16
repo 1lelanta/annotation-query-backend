@@ -31,7 +31,6 @@ from app.annotation_controller import process_full_data
 from app.lib.email import send_email
 from app.lib.query_canonical import canonicalize_graph, query_fingerprint
 from app.error import QueryValidationError
-from app.lib.validator import LogicValidationError
 import threading
 from app.core.config import settings
 from app.api.deps import oauth2_scheme
