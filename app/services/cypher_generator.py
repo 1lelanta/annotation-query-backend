@@ -286,6 +286,7 @@ class CypherQueryGenerator(QueryGeneratorInterface):
         nodes = []
         for node in cls._path_record_value(record, "nodes", []) or []:
             properties = dict(node.get("properties") or {})
+            properties.pop("id", None)
             node_id = node.get("id")
             properties["degree"] = node.get("degree", properties.get("degree", 0))
             nodes.append({

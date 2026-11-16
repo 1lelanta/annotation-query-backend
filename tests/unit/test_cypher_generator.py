@@ -243,6 +243,30 @@ def test_find_paths_pushes_all_filters_and_returns_degree(monkeypatch):
     assert kwargs["params"]["hub_max_degree"] == 12
 
 
+def test_serialize_path_record_removes_id_from_node_properties():
+    record = {
+        "nodes": [
+            {
+                "id": "node-1",
+                "type": "protein",
+                "properties": {"id": "duplicate-id", "degree": 7, "name": "example"},
+                "degree": 7,
+            }
+        ],
+        "edges": [],
+    }
+
+    serialized = CypherQueryGenerator._serialize_path_record(record)
+
+    assert serialized["nodes"] == [
+        {
+            "id": "node-1",
+            "type": "protein",
+            "properties": {"degree": 7, "name": "example"},
+        }
+    ]
+
+
 def test_find_paths_orders_before_limit_by_shared_ranking(monkeypatch):
     generator, calls = path_generator(monkeypatch)
     generator.find_paths(paths_request())
