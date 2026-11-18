@@ -323,7 +323,21 @@ def neo4j_paths():
 def test_real_paths_match_in_memory_fixture(neo4j_paths):
     result = _run_both(neo4j_paths, _request(neo4j_paths))
     assert result["paths"]
-    assert [path["hop_count"] for path in result["paths"]] == [2, 3]
+    assert [path["hop_count"] for path in result["paths"]] == [2, 2, 3]
+    assert [path["score"] for path in result["paths"]] == [950.0, 600.0, 800.0]
+    assert [
+        [node["id"] for node in path["nodes"]]
+        for path in result["paths"]
+    ] == [
+        ["TESTPATHS_gene-a", "TESTPATHS_hub", "TESTPATHS_gene-b"],
+        ["TESTPATHS_gene-a", "TESTPATHS_protein-b", "TESTPATHS_gene-b"],
+        [
+            "TESTPATHS_gene-a",
+            "TESTPATHS_protein-a",
+            "TESTPATHS_pathway-a",
+            "TESTPATHS_gene-b",
+        ],
+    ]
     assert all(edge["evidence"]["score"] for edge in result["paths"][0]["edges"])
 
 
@@ -334,6 +348,7 @@ def test_real_paths_match_in_memory_fixture(neo4j_paths):
         {"edge_types": {"exclude": ["participates_in"]}},
         {"intermediate_node_types": {"exclude": ["pathway"]}},
         {"evidence_filters": [{"field": "p_value", "operator": "<", "value": 0.05}]},
+        {"evidence_filters": [{"field": "score", "operator": ">=", "value": 700}]},
         {"hub_avoidance": {"enabled": False, "exclude_ids": ["TESTPATHS_protein-a"]}},
         {"hub_avoidance": {"enabled": True, "max_degree": 1, "exclude_ids": []}},
     ],
@@ -352,6 +367,10 @@ def test_hub_avoidance_changes_results_without_removing_endpoints(neo4j_paths):
         _request(neo4j_paths, hub_avoidance={"enabled": False, "max_degree": 100, "exclude_ids": []}),
     )
     assert avoided["paths"] != allowed["paths"]
+    assert [path["score"] for path in avoided["paths"]] == [600.0, 800.0]
+    assert [path["hop_count"] for path in avoided["paths"]] == [2, 3]
+    assert [path["score"] for path in allowed["paths"]] == [950.0, 600.0, 800.0]
+    assert [path["hop_count"] for path in allowed["paths"]] == [2, 2, 3]
     assert any(
         path["nodes"][1]["id"] == "TESTPATHS_hub" for path in allowed["paths"]
     )
@@ -494,6 +513,14 @@ def test_truncation_sets_shared_has_more(neo4j_paths):
 def test_real_results_respect_hop_and_repeat_constraints(neo4j_paths):
     request = _request(neo4j_paths, max_hops=2, k=100)
     result = process_candidates(neo4j_paths.generator.find_paths(request), request)
+    assert [path["score"] for path in result["paths"]] == [950.0, 600.0]
+    assert [
+        [node["id"] for node in path["nodes"]]
+        for path in result["paths"]
+    ] == [
+        ["TESTPATHS_gene-a", "TESTPATHS_hub", "TESTPATHS_gene-b"],
+        ["TESTPATHS_gene-a", "TESTPATHS_protein-b", "TESTPATHS_gene-b"],
+    ]
     for path in result["paths"]:
         ids = [node["id"] for node in path["nodes"]]
         assert path["hop_count"] <= 2
