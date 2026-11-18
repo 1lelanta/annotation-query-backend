@@ -55,11 +55,56 @@ class MorkPathMixin:
     def _atom_tuples(atoms):
         if not atoms:
             return []
-        if all(isinstance(atom, tuple) for atom in atoms):
-            return [tuple(atom) for atom in atoms]
-        from app.services.metta.metta_seralizer import metta_seralizer
+        parsed = []
+        for atom in atoms:
+            if isinstance(atom, tuple):
+                parsed.append(atom)
+            else:
+                parsed.extend(MorkPathMixin._parse_metta_text(str(atom)))
+        return parsed
 
-        return [tuple(atom) for atom in metta_seralizer(atoms)]
+    @staticmethod
+    def _parse_metta_text(text):
+        index = 0
+
+        def skip_space():
+            nonlocal index
+            while index < len(text) and text[index].isspace():
+                index += 1
+
+        def parse_expression():
+            nonlocal index
+            skip_space()
+            if index >= len(text):
+                return None
+            if text[index] != "(":
+                start = index
+                while index < len(text) and not text[index].isspace() and text[index] not in "()":
+                    index += 1
+                return text[start:index]
+
+            index += 1
+            items = []
+            while index < len(text):
+                skip_space()
+                if index < len(text) and text[index] == ")":
+                    index += 1
+                    return tuple(items)
+                item = parse_expression()
+                if item is None:
+                    break
+                items.append(item)
+            return tuple(items)
+
+        parsed = []
+        while True:
+            skip_space()
+            if index >= len(text):
+                break
+            item = parse_expression()
+            if item is not None:
+                parsed.append(item)
+        return parsed
 
     def _query(self, deadline, pattern, template):
         if time.monotonic() >= deadline:
@@ -97,61 +142,110 @@ class MorkPathMixin:
                 f"(resolved ({node_type} {node_id}))",
             )
             key = self._node_key(node_type, node_id)
-            if found:
+            if any(atom and atom[0] == "resolved" for atom in found):
                 resolved.add(key)
             else:
                 unresolved.append(node_id)
         return resolved, sorted(set(unresolved))
 
-    def _neighbors(self, node, predicate, reverse, deadline):
+    def _neighbor_edges(self, node, reverse, deadline, cache):
+        key = (node, reverse)
+        if key in cache:
+            return cache[key]
+
         node_type, node_id = node
         self._safe(node_type, "atom", "node type", pattern=True)
         self._safe(node_id, "id", "node id", pattern=True)
-        self._safe(predicate, "atom", "predicate", pattern=True)
         if reverse:
             pattern = (
-                f"({predicate} ($neighbor_type $neighbor_id) "
+                f"($predicate ($neighbor_type $neighbor_id) "
                 f"({node_type} {node_id}))"
             )
             template = (
-                f"(path_edge {predicate} ($neighbor_type $neighbor_id) "
+                f"(path_edge $predicate ($neighbor_type $neighbor_id) "
                 f"({node_type} {node_id}))"
             )
         else:
             pattern = (
-                f"({predicate} ({node_type} {node_id}) "
+                f"($predicate ({node_type} {node_id}) "
                 f"($neighbor_type $neighbor_id))"
             )
             template = (
-                f"(path_edge {predicate} ({node_type} {node_id}) "
+                f"(path_edge $predicate ({node_type} {node_id}) "
                 f"($neighbor_type $neighbor_id))"
             )
         atoms = self._query(deadline, pattern, template)
-        return list(dict.fromkeys(atoms))
+        atoms = list(dict.fromkeys(
+            atom for atom in atoms
+            if len(atom) == 4 and atom[0] == "path_edge"
+        ))
+        cache[key] = atoms
+        return atoms
 
-    def _degree(self, node, deadline, cache):
-        if node in cache:
-            return cache[node]
-        node_type, node_id = node
-        edges = set()
-        for reverse in (False, True):
+    def _neighbors(self, node, predicate, reverse, deadline, cache=None):
+        if cache is None:
+            cache = {}
+        atoms = self._neighbor_edges(node, reverse, deadline, cache)
+        if predicate is None:
+            return atoms
+        if isinstance(predicate, str):
+            allowed = {predicate}
+        else:
+            allowed = set(predicate)
+        return [atom for atom in atoms if atom[1] in allowed]
+
+    def _batch_neighbors(self, nodes, reverse, deadline, cache):
+        uncached = [node for node in nodes if (node, reverse) not in cache]
+        if not uncached:
+            return
+        by_type = {}
+        for node in uncached:
+            by_type.setdefault(node[0], set()).add(node)
+
+        for node_type, type_nodes in by_type.items():
+            self._safe(node_type, "atom", "node type", pattern=True)
             if reverse:
-                pattern = f"($predicate ($neighbor_type $neighbor_id) ({node_type} {node_id}))"
+                pattern = (
+                    f"($predicate ($neighbor_type $neighbor_id) "
+                    f"({node_type} $id))"
+                )
                 template = (
                     f"(path_edge $predicate ($neighbor_type $neighbor_id) "
-                    f"({node_type} {node_id}))"
+                    f"({node_type} $id))"
                 )
             else:
-                pattern = f"($predicate ({node_type} {node_id}) ($neighbor_type $neighbor_id))"
-                template = (
-                    f"(path_edge $predicate ({node_type} {node_id}) "
+                pattern = (
+                    f"($predicate ({node_type} $id) "
                     f"($neighbor_type $neighbor_id))"
                 )
-            for atom in self._query(deadline, pattern, template):
-                if len(atom) == 6 and atom[0] == "path_edge":
-                    edges.add((atom[1], atom[2], atom[3], atom[4], atom[5]))
-        cache[node] = len(edges)
-        return cache[node]
+                template = (
+                    f"(path_edge $predicate ({node_type} $id) "
+                    f"($neighbor_type $neighbor_id))"
+                )
+            atoms = self._query(deadline, pattern, template)
+            atoms = list(dict.fromkeys(
+                atom for atom in atoms
+                if len(atom) == 4 and atom[0] == "path_edge"
+            ))
+            for node in type_nodes:
+                matching = []
+                for atom in atoms:
+                    source = tuple(str(value) for value in atom[2])
+                    target = tuple(str(value) for value in atom[3])
+                    if (reverse and target == node) or (not reverse and source == node):
+                        matching.append(atom)
+                cache[(node, reverse)] = matching
+
+    def _degree(self, node, deadline, cache):
+        degree_key = ("degree", node)
+        if degree_key in cache:
+            return cache[degree_key]
+        edges = set()
+        for reverse in (False, True):
+            for atom in self._neighbor_edges(node, reverse, deadline, cache):
+                edges.add((atom[1], tuple(atom[2]), tuple(atom[3])))
+        cache[degree_key] = len(edges)
+        return cache[degree_key]
 
     def _node_properties(self, node, deadline, cache, degree_cache):
         if node not in cache:
@@ -160,8 +254,8 @@ class MorkPathMixin:
             template = f"(node_property $property ({node_type} {node_id}) $value)"
             properties = {}
             for atom in self._query(deadline, pattern, template):
-                if len(atom) == 5 and atom[0] == "node_property":
-                    properties[str(atom[1])] = self._value(atom[4])
+                if len(atom) == 4 and atom[0] == "node_property":
+                    properties[str(atom[1])] = self._value(atom[3])
             properties.pop("id", None)
             cache[node] = properties
         result = dict(cache[node])
@@ -185,8 +279,10 @@ class MorkPathMixin:
         )
         evidence = {}
         for atom in self._query(deadline, pattern, template):
-            if len(atom) == 8 and atom[0] == "edge_evidence":
-                evidence[str(atom[1])] = self._value(atom[7])
+            if len(atom) == 4 and atom[0] == "edge_evidence":
+                evidence[str(atom[1])] = self._value(atom[3])
+            elif len(atom) == 3 and atom[0] == "ev":
+                evidence[str(atom[1])] = self._value(atom[2])
         cache[key] = evidence
         return evidence
 
@@ -250,6 +346,7 @@ class MorkPathMixin:
         degree_cache = {}
         property_cache = {}
         evidence_cache = {}
+        neighbor_cache = degree_cache
         paths = []
         frontier = [
             {"nodes": [source], "edges": []}
@@ -262,43 +359,50 @@ class MorkPathMixin:
 
         for _ in range(max_hops):
             next_frontier = []
+            frontier_nodes = list(dict.fromkeys(
+                state["nodes"][-1] for state in frontier
+            ))
+            for reverse in (False, True):
+                self._batch_neighbors(
+                    frontier_nodes, reverse, deadline, neighbor_cache
+                )
             for state in frontier:
                 current = state["nodes"][-1]
-                for predicate in sorted(predicates):
-                    for reverse in (False, True):
-                        for atom in self._neighbors(current, predicate, reverse, deadline):
-                            if len(atom) != 6 or atom[0] != "path_edge":
+                for reverse in (False, True):
+                    atoms = neighbor_cache.get((current, reverse), [])
+                    for atom in atoms:
+                        if len(atom) != 4 or atom[0] != "path_edge":
+                            continue
+                        _, atom_predicate, source_node, target_node = atom
+                        if atom_predicate not in predicates:
+                            continue
+                        source = tuple(str(value) for value in source_node)
+                        target = tuple(str(value) for value in target_node)
+                        neighbor = source if reverse else target
+                        if neighbor in state["nodes"]:
+                            continue
+                        if neighbor not in target_nodes:
+                            if neighbor[1] in excluded_ids:
                                 continue
-                            _, atom_predicate, src_type, src_id, tgt_type, tgt_id = atom
-                            source = (str(src_type), str(src_id))
-                            target = (str(tgt_type), str(tgt_id))
-                            if atom_predicate != predicate:
+                            if intermediate_filter["allow"] and neighbor[0] not in intermediate_filter["allow"]:
                                 continue
-                            neighbor = source if reverse else target
-                            if neighbor in state["nodes"]:
+                            if neighbor[0] in intermediate_filter["exclude"]:
                                 continue
-                            if neighbor not in target_nodes:
-                                if neighbor[1] in excluded_ids:
-                                    continue
-                                if intermediate_filter["allow"] and neighbor[0] not in intermediate_filter["allow"]:
-                                    continue
-                                if neighbor[0] in intermediate_filter["exclude"]:
-                                    continue
-                                if hub["enabled"] and self._degree(neighbor, deadline, degree_cache) > hub["max_degree"]:
-                                    continue
-                            edge = {
-                                "predicate": predicate,
-                                "source": source,
-                                "target": target,
-                            }
-                            next_state = {
-                                "nodes": state["nodes"] + [neighbor],
-                                "edges": state["edges"] + [edge],
-                            }
-                            if neighbor in target_nodes:
-                                paths.append(next_state)
-                            elif len(next_state["edges"]) < max_hops:
-                                next_frontier.append(next_state)
+                            if hub["enabled"] and self._degree(neighbor, deadline, neighbor_cache) > hub["max_degree"]:
+                                continue
+                        edge = {
+                            "predicate": atom_predicate,
+                            "source": source,
+                            "target": target,
+                        }
+                        next_state = {
+                            "nodes": state["nodes"] + [neighbor],
+                            "edges": state["edges"] + [edge],
+                        }
+                        if neighbor in target_nodes:
+                            paths.append(next_state)
+                        elif len(next_state["edges"]) < max_hops:
+                            next_frontier.append(next_state)
             frontier = next_frontier
             if not frontier:
                 break
