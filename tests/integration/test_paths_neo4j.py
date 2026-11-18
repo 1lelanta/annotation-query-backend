@@ -22,7 +22,7 @@ from app.services.cypher_generator import (
     _path_schema_whitelist,
 )
 from app.services.path_search import normalize_request, process_candidates
-from tests.fixtures.path_graph import CANDIDATES, NODES
+from tests.fixtures.path_graph import FULL_EDGES, FULL_NODES
 
 
 PREFIX = "TESTPATHS_"
@@ -94,25 +94,10 @@ def _build_test_graph(run_id):
             },
         )
 
-    for node in NODES:
+    for node in FULL_NODES:
         add_node(node)
-    for candidate in CANDIDATES:
-        for node in candidate["nodes"]:
-            add_node(node)
-        for edge in candidate["edges"]:
-            add_edge(edge)
-
-    for index in range(5):
-        leaf_id = f"hub-leaf-{index}"
-        add_node({"id": leaf_id, "type": "protein"})
-        add_edge({
-            "source": "hub",
-            "target": leaf_id,
-            "source_type": "protein",
-            "target_type": "protein",
-            "type": "interacts with",
-            "evidence": {"score": 1, "p_value": 1.0},
-        })
+    for edge in FULL_EDGES:
+        add_edge(edge)
 
     degrees = {node_id: 0 for node_id in nodes_by_id}
     for source, _, target in edges_by_key:
@@ -121,19 +106,36 @@ def _build_test_graph(run_id):
     for node_id, node in nodes_by_id.items():
         node["properties"]["degree"] = degrees[node_id]
 
-    def transform_candidate(candidate):
-        transformed_nodes = [
-            nodes_by_id[_prefixed_id(node["id"])] for node in candidate["nodes"]
-        ]
-        transformed_edges = []
-        for edge in candidate["edges"]:
-            source = _prefixed_id(edge["source"])
-            target = _prefixed_id(edge["target"])
-            edge_type = EDGE_TYPE_MAP[edge["type"]]
-            transformed_edges.append(edges_by_key[(source, edge_type, target)])
-        return {"nodes": transformed_nodes, "edges": transformed_edges}
+    source_id = _prefixed_id("gene-a")
+    target_id = _prefixed_id("gene-b")
+    adjacency = {}
+    for (source, edge_type, target), edge in edges_by_key.items():
+        adjacency.setdefault(source, []).append((target, edge_type, edge))
 
-    candidates = [transform_candidate(candidate) for candidate in CANDIDATES]
+    def enumerate_simple_paths():
+        max_hops = max(1, len(nodes_by_id) - 1)
+        found = []
+
+        def visit(node_id, node_path, edge_path):
+            if node_id == target_id:
+                found.append({"nodes": [nodes_by_id[node] for node in node_path],
+                              "edges": [edge for edge in edge_path]})
+                return
+            if len(edge_path) >= max_hops:
+                return
+            for neighbor, edge_type, edge in adjacency.get(node_id, []):
+                if neighbor in node_path:
+                    continue
+                visit(
+                    neighbor,
+                    node_path + [neighbor],
+                    edge_path + [edge],
+                )
+
+        visit(source_id, [source_id], [])
+        return found
+
+    candidates = enumerate_simple_paths()
     return list(nodes_by_id.values()), list(edges_by_key.values()), candidates
 
 

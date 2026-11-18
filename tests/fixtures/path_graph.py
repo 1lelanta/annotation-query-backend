@@ -27,9 +27,37 @@ EDGES = [
      "type": "regulates", "evidence": {"score": 600, "p_value": 0.04}},
 ]
 
+HUB_LEAF_IDS = [f"hub-leaf-{index}" for index in range(5)]
+FULL_NODES = [
+    *NODES,
+    *[
+        {"id": leaf_id, "type": "protein", "properties": {"degree": 1}}
+        for leaf_id in HUB_LEAF_IDS
+    ],
+]
+FULL_EDGES = [
+    *EDGES,
+    *[
+        {
+            "source": "hub",
+            "target": leaf_id,
+            "source_type": "protein",
+            "target_type": "protein",
+            "type": "interacts with",
+            "evidence": {"score": 1, "p_value": 1.0},
+        }
+        for leaf_id in HUB_LEAF_IDS
+    ],
+]
+
 CANDIDATES = [
     {"nodes": [NODES[0], NODES[1], NODES[2], NODES[3]], "edges": EDGES[:3]},
     {"nodes": [NODES[0], NODES[4], NODES[3]], "edges": [EDGES[3], EDGES[4]]},
+]
+
+FULL_CANDIDATES = [
+    *CANDIDATES,
+    {"nodes": [NODES[0], NODES[6], NODES[3]], "edges": EDGES[5:7]},
 ]
 
 THREE_PATH_CANDIDATES = [

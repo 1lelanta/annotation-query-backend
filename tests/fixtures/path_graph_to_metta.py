@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 
-from tests.fixtures.path_graph import CANDIDATES, NODES
+from tests.fixtures.path_graph import FULL_EDGES, FULL_NODES
 
 
 def _atom(value):
@@ -15,14 +15,15 @@ def _atom(value):
 def write_fixture(directory):
     output = Path(directory)
     output.mkdir(parents=True, exist_ok=True)
-    nodes = {node["id"]: node for node in NODES}
+    nodes = {node["id"]: node for node in FULL_NODES}
     edges = {}
-    for candidate in CANDIDATES:
-        for node in candidate["nodes"]:
-            nodes.setdefault(node["id"], node)
-        for edge in candidate["edges"]:
-            key = (edge["type"], edge["source"], edge["target"])
-            edges.setdefault(key, edge)
+    for edge in FULL_EDGES:
+        key = (
+            edge["type"].replace(" ", "_"),
+            edge["source"],
+            edge["target"],
+        )
+        edges.setdefault(key, edge)
 
     lines = []
     for node in nodes.values():
@@ -30,6 +31,8 @@ def write_fixture(directory):
         node_id = node["id"]
         lines.append(f"({node_type} {node_id})")
         for key, value in node.get("properties", {}).items():
+            if key == "degree":
+                continue
             lines.append(f"({key} ({node_type} {node_id}) {_atom(value)})")
     for edge in edges.values():
         predicate = edge["type"].replace(" ", "_")
