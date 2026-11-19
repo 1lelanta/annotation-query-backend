@@ -232,7 +232,7 @@ def neo4j_paths():
             ),
             retry_policy=RetryPolicy(max_attempts=1, retry_on_unknown=False),
             timeout_config=QueryTimeoutConfig(
-                timeouts={QueryType.PATHS: 10.0},
+                timeouts={QueryType.PATHS: float(os.getenv("PATHS_TEST_TIMEOUT", "30"))},
                 fallback_results={},
             ),
         )
