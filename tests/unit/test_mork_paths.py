@@ -7,7 +7,11 @@ import pytest
 from app.lib.db_resilience import QueryTimeoutError, QueryType
 from app.services import mork_paths
 from app.services.mork_paths import MorkPathMixin
-from app.services.path_search import normalize_request, process_candidates
+from app.services.path_search import (
+    PathRequestError,
+    normalize_request,
+    process_candidates,
+)
 from tests.fixtures.path_graph import (
     CANDIDATES,
     FULL_CANDIDATES,
@@ -261,6 +265,60 @@ def test_hostile_ids_are_rejected_before_patterns(hostile_id):
     assert backend.patterns == []
 
 
+@pytest.mark.parametrize(
+    ("hostile", "field"),
+    [
+        ("'", "id"),
+        ('"', "id"),
+        ("`", "id"),
+        ("(", "id"),
+        (")", "id"),
+        ("\\", "id"),
+        (";", "id"),
+        ("\n", "id"),
+        ("x" * 300, "id"),
+        ("bad)", "node_type"),
+        ("interacts_with; injected", "edge_type"),
+        ("score)\n(injected", "filter_value"),
+    ],
+)
+def test_mork_hostile_query_values_are_rejected(hostile, field):
+    backend = FakeMorkPaths()
+    try:
+        if field == "id":
+            normalized = normalize_request({
+                "sources": [{"type": "gene", "id": hostile}],
+                "targets": [{"type": "gene", "id": "gene-b"}],
+            })
+        elif field == "node_type":
+            normalized = normalize_request({
+                "sources": [{"type": hostile, "id": "gene-a"}],
+                "targets": [{"type": "gene", "id": "gene-b"}],
+            })
+        elif field == "edge_type":
+            normalized = normalize_request({
+                "sources": [{"type": "gene", "id": "gene-a"}],
+                "targets": [{"type": "gene", "id": "gene-b"}],
+                "edge_types": {"allow": [hostile]},
+            })
+        else:
+            normalized = normalize_request({
+                "sources": [{"type": "gene", "id": "gene-a"}],
+                "targets": [{"type": "gene", "id": "gene-b"}],
+                "evidence_filters": [
+                    {"field": "score", "operator": ">=", "value": hostile}
+                ],
+            })
+        backend.find_paths(normalized)
+    except (ValueError, PathRequestError):
+        pass
+    else:
+        raise AssertionError(f"hostile MORK {field} was accepted")
+    assert not any(
+        hostile in pattern for pattern in backend.patterns
+    )
+
+
 def test_atom_tuples_handles_inconsistent_mork_spacing():
     atoms = [
         "(path_edge interacts_with (gene gene-a) (protein hub))",
@@ -278,6 +336,49 @@ def test_mork_evidence_numeric_strings_are_converted():
     assert MorkPathMixin._value("900") == 900
     assert MorkPathMixin._value("3.25") == 3.25
     assert MorkPathMixin._value("high") == "high"
+
+
+def test_mork_space_edge_type_is_canonicalized_to_underscore():
+    candidate = deepcopy(CANDIDATES[1])
+    candidate["edges"][0]["type"] = "interacts with"
+    candidate["edges"][1]["type"] = "regulates"
+    normalized = normalize_request({
+        "sources": [{"type": "gene", "id": "gene-a"}],
+        "targets": [{"type": "gene", "id": "gene-b"}],
+        "edge_types": {"allow": ["interacts_with", "regulates"]},
+        "hub_avoidance": {"enabled": False, "max_degree": 100, "exclude_ids": []},
+    })
+    result = process_candidates({"candidates": [candidate]}, normalized)
+
+    assert result["paths"]
+    assert result["paths"][0]["edges"][0]["type"] == "interacts_with"
+    assert all(
+        edge["type"] in {"interacts_with", "regulates"}
+        for edge in result["paths"][0]["edges"]
+    )
+
+
+def test_node_properties_ignore_edge_and_id_atoms():
+    class PropertyAtomBackend(FakeMorkPaths):
+        def _run_pattern(self, pattern_str, template_str):
+            if pattern_str.startswith("($property (pathway pathway-a)"):
+                return [
+                    "(name (pathway pathway-a) neo4j)",
+                    "(regulates (pathway pathway-a) (gene gene-b))",
+                    "(id (pathway pathway-a) pathway-a)",
+                ]
+            return []
+
+    backend = PropertyAtomBackend()
+    deadline = mork_paths.time.monotonic() + mork_paths._PATH_TIMEOUT_SECONDS
+    degree_cache = {("degree", ("pathway", "pathway-a")): 2}
+    properties = backend._node_properties(
+        ("pathway", "pathway-a"),
+        deadline,
+        {},
+        degree_cache,
+    )
+    assert properties == {"name": "neo4j", "degree": 2}
 
 
 def test_path_graph_metta_fixture_matches_full_graph(tmp_path):

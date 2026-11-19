@@ -4,7 +4,14 @@ from copy import deepcopy
 from numbers import Number
 
 from app.lib.db_resilience import QueryTimeoutError, QueryType
-from app.services.path_search import _ID_RE, _compare
+from app.services.path_search import (
+    MAX_EXPANDED_PATHS,
+    MAX_FRONTIER_SIZE,
+    MAX_RESULT_ROWS,
+    PathSearchResourceError,
+    _ID_RE,
+    _compare,
+)
 
 
 _PATH_TIMEOUT_SECONDS = 10.0
@@ -253,10 +260,36 @@ class MorkPathMixin:
             pattern = f"($property ({node_type} {node_id}) $value)"
             template = f"(node_property $property ({node_type} {node_id}) $value)"
             properties = {}
+            edge_names = {
+                str(value).replace(" ", "_")
+                for value in getattr(self, "path_edge_types", ())
+            }
             for atom in self._query(deadline, pattern, template):
                 if len(atom) == 4 and atom[0] == "node_property":
-                    properties[str(atom[1])] = self._value(atom[3])
-            properties.pop("id", None)
+                    name = str(atom[1])
+                    value = atom[3]
+                    if (
+                        name not in {"id", "degree"}
+                        and name not in edge_names
+                        and not isinstance(value, tuple)
+                        and not isinstance(value, list)
+                    ):
+                        properties[name] = self._value(value)
+                elif len(atom) == 3:
+                    name = str(atom[0])
+                    node_pair = atom[1]
+                    value = atom[2]
+                    if (
+                        name not in {"id", "degree"}
+                        and name not in edge_names
+                        and isinstance(node_pair, tuple)
+                        and len(node_pair) == 2
+                        and str(node_pair[0]) == node_type
+                        and str(node_pair[1]) == node_id
+                        and not isinstance(value, tuple)
+                        and not isinstance(value, list)
+                    ):
+                        properties[name] = self._value(value)
             cache[node] = properties
         result = dict(cache[node])
         result["degree"] = int(self._degree(node, deadline, degree_cache))
@@ -359,6 +392,10 @@ class MorkPathMixin:
 
         for _ in range(max_hops):
             next_frontier = []
+            if len(frontier) > MAX_FRONTIER_SIZE:
+                raise PathSearchResourceError(
+                    f"Path search exceeded MAX_FRONTIER_SIZE ({MAX_FRONTIER_SIZE})"
+                )
             frontier_nodes = list(dict.fromkeys(
                 state["nodes"][-1] for state in frontier
             ))
@@ -403,6 +440,14 @@ class MorkPathMixin:
                             paths.append(next_state)
                         elif len(next_state["edges"]) < max_hops:
                             next_frontier.append(next_state)
+                        if len(paths) > MAX_EXPANDED_PATHS:
+                            raise PathSearchResourceError(
+                                f"Path search exceeded MAX_EXPANDED_PATHS ({MAX_EXPANDED_PATHS})"
+                            )
+                        if len(next_frontier) > MAX_FRONTIER_SIZE:
+                            raise PathSearchResourceError(
+                                f"Path search exceeded MAX_FRONTIER_SIZE ({MAX_FRONTIER_SIZE})"
+                            )
             frontier = next_frontier
             if not frontier:
                 break
