@@ -1,4 +1,5 @@
 import re
+import os
 from copy import deepcopy
 from numbers import Number
 from typing import Any, Iterable
@@ -15,6 +16,27 @@ _EVIDENCE_FIELDS = {
     "support",
 }
 _FILTER_KEYS = {"allow", "exclude"}
+
+
+def _canonical_edge_type(value: Any) -> str:
+    return str(value).strip().replace(" ", "_")
+
+
+def _resource_limit(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+        return value if value >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_FRONTIER_SIZE = _resource_limit("MAX_FRONTIER_SIZE", 10_000)
+MAX_EXPANDED_PATHS = _resource_limit("MAX_EXPANDED_PATHS", 10_000)
+MAX_RESULT_ROWS = _resource_limit("MAX_RESULT_ROWS", 1_000)
+
+
+class PathSearchResourceError(RuntimeError):
+    """The path search exceeded a configured bounded-work limit."""
 
 
 class PathRequestError(ValueError):
@@ -41,7 +63,10 @@ def _normalise_type_filter(value: Any, label: str) -> dict:
         raw = value.get(key, [])
         if not isinstance(raw, list) or not all(isinstance(item, str) and item for item in raw):
             _fail(f"Invalid {label}.{key}")
-        result[key] = sorted(set(raw))
+        if label == "edge_types":
+            result[key] = sorted({_canonical_edge_type(item) for item in raw})
+        else:
+            result[key] = sorted(set(raw))
     if set(result["allow"]) & set(result["exclude"]):
         _fail(f"{label} allow and exclude overlap")
     return result
@@ -214,8 +239,9 @@ def _matches(path: dict, request: dict) -> bool:
     edge_filter = request["edge_types"]
     intermediate_filter = request["intermediate_node_types"]
     for index, edge in enumerate(edges):
-        if edge.get("type") in edge_filter["exclude"] or (
-            edge_filter["allow"] and edge.get("type") not in edge_filter["allow"]
+        edge_type = _canonical_edge_type(edge.get("type"))
+        if edge_type in edge_filter["exclude"] or (
+            edge_filter["allow"] and edge_type not in edge_filter["allow"]
         ):
             return False
         if edge.get("source") != ids[index] or edge.get("target") != ids[index + 1]:
@@ -245,7 +271,7 @@ def _path_key(path: dict) -> tuple:
         len(path["edges"]),
         -_candidate_score(path),
         tuple(str(n.get("id", "")) for n in path["nodes"]),
-        tuple(str(e.get("type", "")) for e in path["edges"]),
+        tuple(_canonical_edge_type(e.get("type")) for e in path["edges"]),
     )
 
 
@@ -261,22 +287,35 @@ def _subgraph(paths: Iterable[dict]) -> dict:
                 }
             }
         for edge in path["edges"]:
-            key = (edge.get("source"), edge.get("target"), edge.get("type"))
-            edges[key] = {"data": deepcopy(edge)}
+            normalized_edge = deepcopy(edge)
+            normalized_edge["type"] = _canonical_edge_type(normalized_edge.get("type"))
+            key = (
+                normalized_edge.get("source"),
+                normalized_edge.get("target"),
+                normalized_edge["type"],
+            )
+            edges[key] = {"data": normalized_edge}
     return {"nodes": list(nodes.values()), "edges": list(edges.values())}
 
 
 def process_candidates(result: dict, request: dict) -> dict:
     candidates = result.get("candidates", []) if isinstance(result, dict) else []
+    if len(candidates) > MAX_RESULT_ROWS:
+        raise PathSearchResourceError(
+            f"Path search exceeded MAX_RESULT_ROWS ({MAX_RESULT_ROWS})"
+        )
     valid = [deepcopy(path) for path in candidates if isinstance(path, dict) and _matches(path, request)]
     valid.sort(key=_path_key)
     selected, has_more = valid[: request["k"]], len(valid) > request["k"]
     paths = []
     for path in selected:
         score = _candidate_score(path)
+        normalized_edges = deepcopy(path["edges"])
+        for edge in normalized_edges:
+            edge["type"] = _canonical_edge_type(edge.get("type"))
         paths.append({
             "nodes": path["nodes"],
-            "edges": path["edges"],
+            "edges": normalized_edges,
             "hop_count": len(path["edges"]),
             "score": score,
             "score_fields": sorted({

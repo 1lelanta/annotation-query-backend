@@ -6,7 +6,11 @@ from fastapi import HTTPException
 
 from app.api.api_v1.endpoints import paths as paths_endpoint
 from app.lib.db_resilience import QueryTimeoutError, QueryType
-from app.services.path_search import normalize_request, process_candidates
+from app.services.path_search import (
+    PathSearchResourceError,
+    normalize_request,
+    process_candidates,
+)
 from tests.fixtures.path_graph import CANDIDATES, THREE_PATH_CANDIDATES
 
 
@@ -234,6 +238,43 @@ def test_realistic_ids_are_accepted(node_id):
         "targets": [{"type": "gene", "id": "gene-b"}],
     })
     assert normalized["sources"][0]["id"] == node_id
+
+
+def test_resource_limit_rejects_oversized_candidate_set(monkeypatch):
+    import app.services.path_search as path_search
+
+    monkeypatch.setattr(path_search, "MAX_RESULT_ROWS", 1)
+    normalized = request(hub_avoidance=False)
+    with pytest.raises(PathSearchResourceError, match="MAX_RESULT_ROWS"):
+        path_search.process_candidates(
+            {"candidates": deepcopy(THREE_PATH_CANDIDATES)},
+            normalized,
+        )
+
+
+def test_resource_limit_allows_normal_candidate_set(monkeypatch):
+    import app.services.path_search as path_search
+
+    monkeypatch.setattr(path_search, "MAX_RESULT_ROWS", 100)
+    result = path_search.process_candidates(
+        {"candidates": deepcopy(THREE_PATH_CANDIDATES)},
+        request(hub_avoidance=False),
+    )
+    assert len(result["paths"]) == 3
+
+
+def test_resource_limit_maps_to_clean_503(monkeypatch):
+    backend = FakeBackend(THREE_PATH_CANDIDATES)
+    monkeypatch.setattr(
+        "app.api.api_v1.endpoints.paths.process_candidates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PathSearchResourceError("MAX_EXPANDED_PATHS exceeded")
+        ),
+    )
+    with pytest.raises(HTTPException) as raised:
+        call_endpoint(backend)
+    assert raised.value.status_code == 503
+    assert "MAX_EXPANDED_PATHS" in raised.value.detail
 
 
 def test_ranking_uses_hops_then_evidence_then_id_tie_break():

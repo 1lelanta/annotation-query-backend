@@ -5,7 +5,12 @@ from fastapi.security import OAuth2PasswordBearer
 
 from app.api.deps import get_current_user, get_db_instance, get_schema_manager
 from app.lib.db_resilience import QueryTimeoutError
-from app.services.path_search import PathRequestError, normalize_request, process_candidates
+from app.services.path_search import (
+    PathRequestError,
+    PathSearchResourceError,
+    normalize_request,
+    process_candidates,
+)
 
 
 router = APIRouter()
@@ -28,11 +33,14 @@ def find_paths(
     db_instance: Any = Depends(get_db_instance),
     schema_manager: Any = Depends(get_schema_manager),
 ):
+    """Find bounded, deterministic paths; timeout returns 504 only (no partial paths)."""
     del current_user_id
     try:
         normalized = normalize_request(data, schema_manager)
     except PathRequestError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+    except PathSearchResourceError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     if not hasattr(db_instance, "find_paths"):
         raise HTTPException(status_code=500, detail="The configured backend does not support paths")
     try:
@@ -41,7 +49,10 @@ def find_paths(
         raise HTTPException(status_code=504, detail="Path search timed out") from error
     except PathRequestError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    response = process_candidates(result, normalized)
+    try:
+        response = process_candidates(result, normalized)
+    except PathSearchResourceError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
     requested_ids = {
         node["id"] for node in normalized["sources"] + normalized["targets"]
     }

@@ -12,6 +12,7 @@ import yaml
 from app.lib.db_resilience import ResilientDriver, RetryPolicy, QueryType, QueryTimeoutConfig
 from app.lib.result_formatter import Result_Formatter
 from app.lib.validator import LogicValidationError, negated_predicate_ends, or_predicate_ends
+from app.services.path_search import MAX_RESULT_ROWS, PathSearchResourceError
 from collections import deque
 
 load_dotenv()
@@ -389,6 +390,10 @@ RETURN
             params=params,
         )
         records = list(records)
+        if len(records) > MAX_RESULT_ROWS:
+            raise PathSearchResourceError(
+                f"Path search exceeded MAX_RESULT_ROWS ({MAX_RESULT_ROWS})"
+            )
         return {
             "candidates": [
                 self._serialize_path_record(record) for record in records[:candidate_cap]
